@@ -1,15 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
-
-	"github.com/araddon/dateparse"
 )
 
 type ImageMetadata struct {
@@ -32,16 +32,94 @@ type ImageMetadata struct {
 
 const Layout = "2006-01-02T15:04:05"
 
-func isImageRunningInCluster(clusterImages []string, imageToDelete ImageMetadata, repository string) (string, error) {
-	for _, clusterImage := range clusterImages {
-		for _, tag := range imageToDelete.Tags {
-			if strings.Contains(clusterImage, fmt.Sprintf("%s:%s", repository, tag)) {
-				return clusterImage, fmt.Errorf("image is running in your provided k8s clusters")
+func isImageRunningInCluster(contexts map[string][]string, imageToDelete ImageMetadata, repository string, registry string) error {
+	for context, images := range contexts {
+		for _, image := range images {
+			for _, tag := range imageToDelete.Tags {
+				if image == fmt.Sprintf("%s.azurecr.io/%s:%s", registry, repository, tag) {
+					return fmt.Errorf("image with tag %s is running in the k8s context %s", tag, context)
+				}
 			}
 		}
 	}
 
-	return "", nil
+	return nil
+}
+
+func parseKubectlContexts(k8sImages *[]string) error {
+	output, err := exec.Command(
+		"bash",
+		"-c",
+		"kubectl config get-contexts -o name",
+	).Output()
+
+	if err != nil {
+		return err
+	}
+
+	for _, context := range strings.Split(string(output), "\n") {
+		if len(context) <= 1 {
+			continue
+		}
+
+		*k8sImages = append(*k8sImages, context)
+	}
+
+	return nil
+}
+
+func watchCmd(cmd string) error {
+	azPurge := exec.Command("bash", "-c", fmt.Sprintf("%s", cmd))
+
+	stdout, err := azPurge.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	err = azPurge.Start()
+	if err != nil {
+		return err
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	go func() {
+		for scanner.Scan() {
+			log.Println(scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	err = azPurge.Wait()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func parseAgo(ago *string) (time.Time, error) {
+	durationStr := (*ago)[:len(*ago)-1]
+	durationType := string((*ago)[len(*ago)-1])
+
+	durationInt, err := strconv.Atoi(durationStr)
+	if err != nil {
+		return time.Now(), fmt.Errorf("invalid duration number")
+	}
+
+	switch strings.ToLower(durationType) {
+	case "s":
+		return time.Now().Add(time.Duration(-durationInt) * time.Second), nil
+	case "m":
+		return time.Now().Add(time.Duration(-durationInt) * time.Minute), nil
+	case "h":
+		return time.Now().Add(time.Duration(-durationInt) * time.Hour), nil
+	case "d":
+		return time.Now().AddDate(0, 0, -durationInt), nil
+	default:
+		return time.Now(), fmt.Errorf("invalid duration type. Please use 's' for seconds, 'm' for minutes, 'h' for hours, or 'd' for days")
+	}
 }
 
 func main() {
@@ -49,8 +127,8 @@ func main() {
 	repositoryName := flag.String("repository", "", "Name of the repository in your registry")
 	subscriptionId := flag.String("subscription", "", "ID of the subscription. If not specified it will use the default one")
 	contexts := flag.String("contexts", "", "Comma-separated list of Kubernetes contexts. The deletion process will not start if any 'imageToDelete' is running in a cluster from the context list")
-	deletionCutoffTimestamp := flag.String("timestamp", "01/01/2024", "All Images before the timestamp will get deleted")
-	delay := flag.Float64("delay", 1, "Delay between deletion requests")
+	allContexts := flag.Bool("all-contexts", false, "The deletion process will not start if any 'imageToDelete' is running in a cluster from your kubeconfig contexts")
+	ago := flag.String("ago", "360d", "Time duration in the past. Expects a number followed by a duration type: 's' for seconds, 'm' for minutes, 'h' for hours, 'd' for days.")
 	dryRunMode := flag.Bool("dry-run", false, "Perform a dry run, print tags to be deleted but do not delete them")
 	flag.Parse()
 
@@ -59,47 +137,73 @@ func main() {
 		return
 	}
 
+	if *ago == "" {
+		log.Println("You must provide a duration ago")
+		return
+	}
+
 	if *subscriptionId != "" {
 		_, err := exec.Command("bash", "-c", fmt.Sprintf("az account set --subscription %s", *subscriptionId)).Output()
 		if err != nil {
 			log.Println("Failed to set az subscription: ", err)
+			log.Println("Are you logged in? (az login)")
 			return
 		}
 	}
 
-	var k8sImages []string
-	if len(*contexts) >= 0 {
+	providedContexts := make([]string, 0)
+	if len(*contexts) > 0 {
 		for _, context := range strings.Split(*contexts, ",") {
+			if len(context) <= 1 {
+				continue
+			}
+
+			providedContexts = append(providedContexts, strings.TrimSpace(context))
+		}
+	}
+
+	if len(providedContexts) == 0 && *allContexts {
+		err := parseKubectlContexts(&providedContexts)
+		if err != nil {
+			log.Fatalf("Error parsing all context from your kube config: %s", err)
+		}
+	}
+
+	k8sImages := map[string][]string{}
+	if len(providedContexts) > 0 {
+		log.Printf("Parsing images from the following contexts: %s\n", strings.Join(providedContexts, ","))
+
+		for _, context := range providedContexts {
 			output, err := exec.Command(
 				"bash",
 				"-c",
 				fmt.Sprintf("kubectl get pods --context %s --all-namespaces -o jsonpath=\"{.items[*].spec.containers[*].image}\"", context),
 			).Output()
 			if err != nil {
-				log.Println("Failed to set az subscription: ", err)
-				return
+				log.Printf("Failed to get images from context: %s with error %s \n", context, err)
+				continue
 			}
 
 			for _, image := range strings.Split(string(output), " ") {
-				k8sImages = append(k8sImages, image)
+				k8sImages[context] = append(k8sImages[context], image)
 			}
 		}
 	}
 
-	parsedDate, err := dateparse.ParseAny(*deletionCutoffTimestamp)
+	dateAgo, err := parseAgo(ago)
 	if err != nil {
-		log.Println("Unable to parse the provided date: ", err)
+		log.Println("Unable to parse the provided ago timespan: ", err)
 		return
 	}
 
 	listManifestsCmd := fmt.Sprintf(
 		"az acr manifest list-metadata --name %s --registry %s --orderby time_asc --query \"[?lastUpdateTime < '%s']\"",
-		*repositoryName, *registryName, parsedDate.Format(Layout),
+		*repositoryName, *registryName, dateAgo.Format(Layout),
 	)
-
 	manifestInformation, err := exec.Command("bash", "-c", listManifestsCmd).Output()
 	if err != nil {
-		log.Println("Failed to retrieve manifest information: ", err)
+		log.Printf("Failed to retrieve manifest information from repository %s. Error: %s \n", *repositoryName, err)
+		return
 	}
 
 	var imageMetadataList []ImageMetadata
@@ -110,44 +214,42 @@ func main() {
 	}
 
 	if len(imageMetadataList) == 0 {
-		log.Printf("No Docker Images found which succeed the deletionCutoffTimestamp %s\n", parsedDate)
+		log.Printf("No Docker Images found which succeed the date %s\n", dateAgo)
 		return
 	}
 
-	var imagesToDelete []ImageMetadata
+	const bytesToGB = 1024 * 1024 * 1024
+	totals := map[string]int{
+		"images": 0,
+		"bytes":  0,
+	}
 	for _, metadata := range imageMetadataList {
 		if len(metadata.Tags) == 0 {
 			continue
 		}
 
 		if len(k8sImages) != 0 {
-			image, err := isImageRunningInCluster(k8sImages, metadata, *repositoryName)
+			err = isImageRunningInCluster(k8sImages, metadata, *repositoryName, *registryName)
 			if err != nil {
-				log.Fatalf("Error: The Image %s is running in one of your cluster. Please reconsider your deletion timestamp. \n", image)
+				log.Fatalf("Error: %s", err)
+				return
 			}
 		}
 
-		if *dryRunMode {
-			log.Printf("[DRY-RUN] Docker Image %s with tags %s would get deleted. Created Time: %s \n", *repositoryName, strings.Join(metadata.Tags, ","), metadata.CreatedTime)
-			continue
-		}
-
-		if len(metadata.Digest) > 0 {
-			imagesToDelete = append(imagesToDelete, metadata)
-		}
+		log.Printf("[DRY-RUN] Docker Image %s with tags %s would get deleted. Created Time: %s \n", *repositoryName, strings.Join(metadata.Tags, ","), metadata.CreatedTime)
+		totals["images"]++
+		totals["bytes"] += metadata.ImageSize
 	}
 
-	if len(imagesToDelete) == 0 {
-		return
+	log.Printf("Found %d docker images with approximately %.2f GB worth of data to delete.", totals["images"], float64(totals["bytes"])/float64(bytesToGB))
+
+	azPurgeCmd := fmt.Sprintf("az acr run --cmd=\"acr purge --filter '%s:.*' --ago=%s --untagged \" --registry %s /dev/null", *repositoryName, *ago, *registryName)
+	if *dryRunMode {
+		azPurgeCmd = fmt.Sprintf("az acr run --cmd=\"acr purge --filter '%s:.*' --ago=%s --untagged --dry-run\" --registry %s /dev/null", *repositoryName, *ago, *registryName)
 	}
 
-	amountImages := 0
-	for _, imageToDelete := range imagesToDelete {
-		log.Printf("Docker Image %s with tags %s will get deleted. Created Time: %s \n", *repositoryName, strings.Join(imageToDelete.Tags, ","), imageToDelete.CreatedTime)
-		amountImages++
-	}
-
-	log.Printf("%d Images will get deleted. Do you want to perfom the deletion? Please answer with yes\n", amountImages)
+	log.Printf("Generated az purge cmd: %s", azPurgeCmd)
+	log.Printf("Do you want to perfom the deletion? Please answer with yes")
 
 	var response string
 	_, err = fmt.Scanln(&response)
@@ -161,24 +263,8 @@ func main() {
 		return
 	}
 
-	log.Printf("Starting deletion process with a delay of %f s \n", *delay)
-	for _, imageToDelete := range imagesToDelete {
-		if len(imageToDelete.Digest) == 0 {
-			log.Printf("Skipping image with tags: %s since it has not digest \n", strings.Join(imageToDelete.Tags, ","))
-		}
-
-		deleteManifest := fmt.Sprintf(
-			"az acr repository delete --name %s --image %s@%s --yes",
-			*registryName, *repositoryName, imageToDelete.Digest,
-		)
-		_, err := exec.Command("bash", "-c", deleteManifest).Output()
-		if err != nil {
-			log.Printf("Error fulfilling deletion command: %s\n", err)
-		}
-
-		log.Printf("Deleted image %s with tags: %s \n", *repositoryName, strings.Join(imageToDelete.Tags, ","))
-		time.Sleep(time.Second * time.Duration(*delay))
+	err = watchCmd(azPurgeCmd)
+	if err != nil {
+		log.Fatalf("Error fulfilling az purge command: %s", err)
 	}
-
-	log.Printf("Done. Goodbye!")
 }

@@ -1,28 +1,23 @@
 # Azure ACR Purge Control 🗑️
 
-``acrpurgectl`` is a tool that extends the az-cli acr deletion command.
+``acrpurgectl`` is a tool that extends the az acr purge deletion command.
 It parses all images from the Kubernetes (k8s) contexts that you provide and ensures that no
 image currently running in your cluster is deleted.
-
-## Key Features
-- Takes into account the list of Kubernetes contexts during the deletion process, ensuring no running image is deleted.
-- Eliminates the need to pay for ACR tasks.
-- Offers a familiar workflow inspired by the "terraform plan" and "terraform apply" approach.
-- Allows for the use of the "dry-run" command to preview tags before actual deletion, instilling confidence in your actions.
 
 ## CLI Commands
 
 Here are the available CLI commands and their descriptions:
 
-| Command                            | Description                                                                                                                                            |
-|------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--registry <registry_name>`       | Set the name of the Azure Container Registry.                                                                                                          |
-| `--repository <repository_name>`   | Set the name of the repository in your Azure Container Registry.                                                                                       |
-| `--subscription <subscription_id>` | Set the ID of the Azure subscription. If not specified, the default one will be used.                                                                  |
-| `--timestamp <cutoff_timestamp>`   | Set the cutoff timestamp. All images before this timestamp will be deleted. Default: 01/01/2024.                                                       |
-| `--delay <delay_in_seconds>`       | Set the delay (in seconds) between deletion requests. Default: 1 second.                                                                               |
-| `--contexts <context_list>`        | Comma-separated list of Kubernetes contexts. The deletion process will not start if any 'imageToDelete' is running in a cluster from the context list. |
-| `--dry-run`                        | Perform a dry run, printing the tags to be deleted but do not delete them.                                                                             |
+| Flag           | Default Value | Description                                                                                            |
+|----------------|---------------|--------------------------------------------------------------------------------------------------------|
+| `registry`     | ""            | Name of the Azure Container Registry.                                                                  |
+| `repository`   | ""            | Name of the repository in your registry.                                                               |
+| `subscription` | ""            | ID of the subscription. If not specified it will use the default one.                                  |
+| `contexts`     | ""            | Comma-separated list of Kubernetes contexts. Deletion process will not start if image is running here. |
+| `all-contexts` | false         | Deletion process will not start if image is running in a cluster from your kubeconfig contexts.        |
+| `ago`          | "360d"        | Time duration in the past. Number followed by a duration type: 's' for seconds, 'm' for minutes, etc.  |
+| `dry-run`      | false         | Perform a dry run, print tags to be deleted but do not delete them.                                    |
+
 
 ## Usage with Docker
 
@@ -43,7 +38,7 @@ az login
 Execute Azure ACR Purge with your desired parameters. For example:
 
 ```sh
-./acrpurgectl --repository test/repo-a --registry testregistry --subscription 1111-2222-3333-4444 --timestamp 01/02/2021
+./acrpurgectl --repository test/repo-a --registry testregistry --subscription 1111-2222-3333-4444 --ago 360d
 ```
 
 If you want to use the `--contexts` option, you need to share your local kubeconfig file with the Docker container, to allow Azure ACR Purge to access your Kubernetes contexts:
@@ -55,7 +50,7 @@ docker run -it --rm -v /path/to/your/.kube/config:/root/.kube/config ghcr.io/h3a
 Then execute Azure ACR Purge with the `--contexts` parameter:
 
 ```sh
-./acrpurgectl --repository test/repo-a --registry testregistry --subscription 1111-2222-3333-4444 --timestamp 01/02/2021 --contexts context1,context2
+./acrpurgectl --repository test/repo-a --registry testregistry --subscription 1111-2222-3333-4444 --ago 360d --contexts context1,context2
 ```
 
 This will initiate the process to delete old images from the specified repository in your Azure Container Registry based on the provided parameters. 
