@@ -2,7 +2,7 @@ FROM bitnami/kubectl:1.20.9 as kubectl
 FROM golang:1.20-alpine as builder
 WORKDIR /app
 
-COPY go.sum go.mod ./
+COPY go.mod ./
 COPY cmd/main.go main.go
 RUN go mod download
 RUN go build -o acrpurgectl main.go
